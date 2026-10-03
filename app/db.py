@@ -105,6 +105,33 @@ def _ensure_approval_event_waitlist_columns() -> None:
             )
 
 
+def _ensure_approval_event_scheduled_columns() -> None:
+    """Add scheduled-approval-era columns to ``approval_events`` on older DBs.
+
+    ``scheduled_approved`` marks approvals decided automatically at an
+    operator-arranged instant; ``scheduled_reservation_id`` links the
+    appointment that produced them.  Both are added idempotently; every
+    historical approval starts as ``0`` / NULL.
+    """
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns("approval_events")}
+    with engine.begin() as conn:
+        if "scheduled_approved" not in columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE approval_events "
+                    "ADD COLUMN scheduled_approved BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+        if "scheduled_reservation_id" not in columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE approval_events "
+                    "ADD COLUMN scheduled_reservation_id INTEGER"
+                )
+            )
+
+
 def _ensure_emergency_columns() -> None:
     """Add emergency-occupation-era columns to older databases.
 
@@ -194,6 +221,7 @@ def init_db() -> None:
     _ensure_guard_band_column()
     _ensure_suspended_revision_column()
     _ensure_approval_event_waitlist_columns()
+    _ensure_approval_event_scheduled_columns()
     _ensure_emergency_columns()
     with SessionLocal() as session, session.begin():
         meta = session.get(RevisionMeta, 1)

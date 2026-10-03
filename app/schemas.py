@@ -218,3 +218,29 @@ class EmergencyOccupationReleaseRequest(BaseModel):
 
     expected_revision: int = Field(ge=0)
     reason: str = Field(default="", max_length=2000)
+
+
+class ScheduledApprovalRequest(BaseModel):
+    """Arrange an automatic approval of a pending application at a UTC instant.
+
+    The instant must be timezone-aware and strictly in the future and must
+    precede the application's half-open period end; structural shape problems
+    use the standard validation envelope and the instant-range rules are
+    enforced in the handler (they need the stored application).  Creation
+    consumes no revision.
+    """
+
+    scheduled_at: datetime
+    reason: str = Field(default="", max_length=2000)
+
+
+class ScheduledApprovalRescheduleRequest(BaseModel):
+    """Move an existing scheduled appointment to another valid UTC instant.
+
+    Same range rules as creation: aware, in the future, before the
+    application period ends.  The reservation id stays stable.  The optional
+    reason replaces the stored one only when supplied.
+    """
+
+    scheduled_at: datetime
+    reason: str | None = Field(default=None, max_length=2000)

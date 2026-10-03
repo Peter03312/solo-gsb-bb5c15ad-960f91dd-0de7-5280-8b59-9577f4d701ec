@@ -405,3 +405,96 @@ post "/api/emergency-occupations/999999/release" "{\"expected_revision\":$FINAL}
 curl -s "$BASE/api/emergency-occupations?include_inactive=true" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print("occupations:", [(o["id"],o["application_id"],o["status"],o.get("released_revision")) for o in d["occupations"]])'
 
+
+echo "== 51. scheduled approval: invalid times rejected with no reservation left =="
+# A short-lived application whose period starts now and ends in 3 minutes.
+S=$(python3 - "$BASE" << 'PY'
+import json, sys, urllib.request
+from datetime import datetime, timedelta, timezone
+base = sys.argv[1]
+now = datetime.now(timezone.utc)
+payload = {
+  "name":"scheduled S",
+  "circle":{"cx":0,"cy":0,"radius":10},
+  "frequency":{"low":900,"high":910},
+  "time_window":{"start": now.isoformat().replace("+00:00","Z"),
+                 "end": (now + timedelta(minutes=3)).isoformat().replace("+00:00","Z")},
+}
+req = urllib.request.Request(base + "/api/applications",
+    data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"})
+print(json.load(urllib.request.urlopen(req))["id"])
+PY
+)
+S_ID=$S
+# Past instant -> 422 scheduled_at_invalid (scheduled_at_not_in_future), no row.
+post "/api/applications/$S_ID/scheduled-approval" \
+  "$(python3 -c 'import json; from datetime import datetime, timezone, timedelta; print(json.dumps({"scheduled_at": (datetime.now(timezone.utc)-timedelta(seconds=5)).isoformat().replace("+00:00","Z")}))')" \
+  | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("past ->", e["code"], [d["code"] for d in e["details"]])'
+curl -s "$BASE/api/applications/$S_ID/scheduled-approval" \
+  | python3 -c 'import json,sys; print("reservations after rejection:", json.load(sys.stdin)["reservation_ids"])'
+# Instant at/after the period end -> 422 scheduled_at_not_before_period_end.
+END=$(curl -s "$BASE/api/applications/$S_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["time_window"]["end"])')
+post "/api/applications/$S_ID/scheduled-approval" "{\"scheduled_at\":\"$END\"}" \
+  | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("at period end ->", e["code"], [d["code"] for d in e["details"]])'
+
+echo "== 52. scheduled approval: arrange (no revision), reschedule, then it fires and consumes one revision =="
+WHEN=$(python3 -c 'import json; from datetime import datetime, timezone, timedelta; print(json.dumps({"scheduled_at": (datetime.now(timezone.utc)+timedelta(seconds=8)).isoformat().replace("+00:00","Z"),"reason":"ops pre-arranged"}))')
+RSV=$(post "/api/applications/$S_ID/scheduled-approval" "$WHEN")
+echo "$RSV" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("created reservation", d["id"], d["status"], "at", d["scheduled_at"], "; current_revision", d["current_revision"])'
+RID=$(echo "$RSV" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+# A second appointment for the same application is refused (409).
+post "/api/applications/$S_ID/scheduled-approval" "$WHEN" \
+  | python3 -c 'import json,sys; print("second appointment ->", json.load(sys.stdin)["error"]["code"])'
+# Move it a little earlier so the walkthrough does not wait long.
+NEWWHEN=$(python3 -c 'import json; from datetime import datetime, timezone, timedelta; print(json.dumps({"scheduled_at": (datetime.now(timezone.utc)+timedelta(seconds=2)).isoformat().replace("+00:00","Z")}))')
+post "/api/scheduled-approvals/$RID/reschedule" "$NEWWHEN" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rescheduled: id still", d["id"], "->", d["scheduled_at"], d["status"])'
+# Wait for the background worker to process the due appointment (poll interval is 0.25s).
+for i in $(seq 1 40); do
+  ST=$(curl -s "$BASE/api/scheduled-approvals/$RID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+  [ "$ST" != "scheduled" ] && break
+  sleep 0.5
+done
+curl -s "$BASE/api/scheduled-approvals/$RID" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("reservation ->", d["status"], "; processed_at:", d.get("processed_at"), "; approval_revision:", d.get("approval_revision"))'
+curl -s "$BASE/api/applications/$S_ID" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("application ->", d["status"], "at revision", d["approval_revision"])'
+APPROVED_REV=$(curl -s "$BASE/api/scheduled-approvals/$RID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["approval_revision"])')
+curl -s "$BASE/api/revision/$APPROVED_REV" \
+  | python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin)["approvals"] if x["revision"]=='"$APPROVED_REV"'][0]; print("history flags: scheduled_approved =", a["scheduled_approved"], "; scheduled_reservation_id =", a["scheduled_reservation_id"], "; auto_approved =", a["auto_approved"], "; emergency =", a["emergency"])'
+# Cancel/reschedule on a terminal appointment are refused.
+post "/api/scheduled-approvals/$RID/cancel" \
+  | python3 -c 'import json,sys; print("cancel terminal ->", json.load(sys.stdin)["error"]["code"])'
+
+echo "== 53. scheduled approval blocked: detail stored, application stays pending, no revision, no retry =="
+# Owner T occupies [920,930]; appointment U [921,929] overlaps it (guard band 2.0).
+B=$(python3 - "$BASE" << 'PY'
+import json, sys, urllib.request
+from datetime import datetime, timedelta, timezone
+base = sys.argv[1]
+now = datetime.now(timezone.utc)
+def mk(name, lo, hi, mins):
+    payload = {"name":name,"circle":{"cx":0,"cy":0,"radius":10},
+      "frequency":{"low":lo,"high":hi},
+      "time_window":{"start": now.isoformat().replace("+00:00","Z"),
+                     "end": (now + timedelta(minutes=mins)).isoformat().replace("+00:00","Z")}}
+    req = urllib.request.Request(base + "/api/applications",
+        data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"})
+    return json.load(urllib.request.urlopen(req))["id"]
+print(mk("owner T", 920, 930, 5), mk("blocked U", 921, 929, 5))
+PY
+)
+T_ID=$(echo $B | cut -d' ' -f1); U_ID=$(echo $B | cut -d' ' -f2)
+REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/applications/$T_ID/approve" "{\"expected_revision\":$REV}" >/dev/null
+UWHEN=$(python3 -c 'import json; from datetime import datetime, timezone, timedelta; print(json.dumps({"scheduled_at": (datetime.now(timezone.utc)+timedelta(seconds=2)).isoformat().replace("+00:00","Z")}))')
+URID=$(post "/api/applications/$U_ID/scheduled-approval" "$UWHEN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+for i in $(seq 1 40); do
+  ST=$(curl -s "$BASE/api/scheduled-approvals/$URID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+  [ "$ST" != "scheduled" ] && break
+  sleep 0.5
+done
+curl -s "$BASE/api/scheduled-approvals/$URID" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("reservation ->", d["status"], "; conflicts:", [(c["application"]["id"], c["reason"]) for c in d.get("blocked_details",{}).get("conflicts",[])])'
+curl -s "$BASE/api/applications/$U_ID" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("U stays", d["status"], "; approval_revision:", d["approval_revision"])'
+# Revoking the blocker does NOT retry the blocked appointment (no auto retry).
+post "/api/applications/$T_ID/revoke" '{"reason":"gone"}' >/dev/null
+sleep 1
+curl -s "$BASE/api/scheduled-approvals/$URID" | python3 -c 'import json,sys; print("after blocker released, reservation is still", json.load(sys.stdin)["status"], "(no automatic retry)")'

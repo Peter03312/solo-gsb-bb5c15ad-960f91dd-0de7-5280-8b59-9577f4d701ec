@@ -5,6 +5,10 @@ import tempfile
 _TMP = tempfile.mkdtemp(prefix="radio-tests-")
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{_TMP}/test.db")
 os.environ.setdefault("GUARD_BAND", "2.0")
+# Keep the live due-approval poller from racing the deterministic tests (they
+# call process_due_scheduled_approvals() directly); the single background
+# end-to-end test shortens the running worker's interval itself.
+os.environ.setdefault("SCHEDULED_APPROVAL_POLL_SECONDS", "3600")
 
 import pytest
 from fastapi.testclient import TestClient

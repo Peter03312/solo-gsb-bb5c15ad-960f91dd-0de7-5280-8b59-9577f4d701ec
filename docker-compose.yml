@@ -30,6 +30,9 @@ services:
       GUARD_BAND: "2.0"
       APP_HOST: "0.0.0.0"
       APP_PORT: "8000"
+      # Due scheduled-approval poll interval (seconds); due appointments are
+      # also processed synchronously at startup (restart catch-up).
+      SCHEDULED_APPROVAL_POLL_SECONDS: "0.25"
     ports:
       - "8000:8000"
 

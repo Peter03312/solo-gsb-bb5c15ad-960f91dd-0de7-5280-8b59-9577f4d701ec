@@ -47,6 +47,21 @@ History is event-sourced:
                            release revocation are ordinary approval /
                            revocation events flagged ``emergency`` /
                            ``emergency_release``;
+* ``scheduled_approvals`` - one row per operator-arranged UTC appointment at
+                           which a still-pending application is to be
+                           automatically re-adjudicated.  Creation consumes no
+                           revision; at most one ``scheduled`` appointment
+                           exists per application.  The appointment may be
+                           cancelled or rescheduled before it is due; any
+                           manual/handover/emergency/waitlist approval of the
+                           application first invalidates it.  When it becomes
+                           due (also replayed once at startup as restart
+                           catch-up) it is re-adjudicated inside the shared
+                           revision arbitration: passers are approved as
+                           ordinary ``approval_events`` flagged
+                           ``scheduled_approved`` and consume one revision,
+                           blocked applications stay pending, consume no
+                           revision and are not retried;
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -69,8 +84,10 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -158,6 +175,21 @@ class ApprovalEvent(Base):
     # otherwise an ordinary, immutable approval record.
     emergency: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
+    )
+    # True when this approval was decided automatically at the instant an
+    # operator had arranged in advance (a scheduled approval).  Distinct from
+    # ``auto_approved`` (the waitlist drain): a scheduled decision never
+    # triggers a waitlist re-adjudication and a queued application leaves the
+    # waitlist before its scheduled approval.  The event is otherwise an
+    # ordinary, immutable approval record; ``scheduled_reservation_id`` links
+    # the appointment that produced it.
+    scheduled_approved: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    # For a scheduled auto approval: the id of the ScheduledApproval that
+    # produced it (NULL for every other kind of approval).
+    scheduled_reservation_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
@@ -531,4 +563,104 @@ class EmergencyOccupation(Base):
     )
     released_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+
+class ScheduledApproval(Base):
+    """An operator-arranged UTC appointment to auto-decide a pending application.
+
+    Creation consumes no revision and never changes the application's
+    ``pending`` status.  The appointment instant (``scheduled_at``) must be
+    strictly later than creation and strictly earlier than the application's
+    half-open period end (``end_time``).  At most one ``scheduled``
+    appointment may exist per application; it can be cancelled or rescheduled
+    any time before it becomes due.
+
+    Life cycle (``status``):
+
+    * ``scheduled``   - waiting for its instant (the only mutable state);
+    * ``approved``    - due processing re-adjudicated the application under
+                        the live guard band, effective licenses and active
+                        restriction windows, it passed and was approved at
+                        ``approval_revision`` (one consumed revision);
+    * ``blocked``     - due processing found interference or a window hit; the
+                        blocking detail is stored on the row, the application
+                        stays ``pending``, no revision is consumed and the
+                        appointment is never retried automatically;
+    * ``cancelled``   - withdrawn by the operator before it was due;
+    * ``invalidated`` - the application was decided another way (manual,
+                        batch, handover, emergency or waitlist auto approval)
+                        before the appointment was due.
+
+    Due processing and startup catch-up run inside the shared revision
+    arbitration (the singleton ``revision_meta`` row lock): exactly one
+    outcome per appointment ever takes effect and a restart never approves an
+    application twice.  A scheduled approval of a queued application removes
+    its waitlist entry first and never triggers a waitlist re-adjudication.
+    ``blocked_details`` is a JSON document with the adjudicator's conflicts
+    and restriction-window hits at processing time (NULL until processed).
+    """
+
+    __tablename__ = "scheduled_approvals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # The arranged UTC approval instant; rescheduling rewrites this in place
+    # (the reservation id stays stable).
+    scheduled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="scheduled",
+        server_default="scheduled",
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Actual processing instant for approved/blocked (the startup catch-up
+    # instant can be later than ``scheduled_at``); NULL while still waiting.
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Revision consumed by the scheduled auto approval; NULL unless approved.
+    approval_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # JSON document: {"current_revision", "guard_band", "conflicts",
+    # "restriction_window_conflicts"} for a blocked appointment.
+    blocked_details: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True
+    )
+    # Why an appointment left the waiting state without processing:
+    # "cancelled" (operator), "manual_approval", "batch_approval",
+    # "license_transfer", "emergency_approval", "waitlist_auto_approval".
+    # NULL for approved/blocked.
+    invalidated_reason: Mapped[str | None] = mapped_column(
+        String(40), nullable=True
+    )
+    invalidated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (
+        # Due processing scans the waiting queue in appointment order.
+        Index("ix_scheduled_approvals_due", "status", "scheduled_at"),
+        Index("ix_scheduled_approvals_application", "application_id"),
+        # At most one *waiting* appointment per application (historical rows in
+        # any terminal state are unlimited).  Partial unique index on both
+        # supported backends; all writers additionally serialise on the
+        # singleton revision lock, this is the last line of defence.
+        Index(
+            "ux_scheduled_approvals_waiting_per_app",
+            "application_id",
+            unique=True,
+            sqlite_where=text("status = 'scheduled'"),
+            postgresql_where=text("status = 'scheduled'"),
+        ),
     )

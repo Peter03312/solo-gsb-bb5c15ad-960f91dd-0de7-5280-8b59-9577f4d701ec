@@ -27,5 +27,21 @@ class Settings:
         self.app_host: str = os.getenv("APP_HOST", "0.0.0.0")
         self.app_port: int = int(os.getenv("APP_PORT", "8000"))
 
+        # How often the in-process due-approval worker scans for scheduled
+        # appointments whose UTC instant has arrived (seconds).  Due
+        # appointments are also processed once synchronously at startup
+        # (restart catch-up), so a larger interval only delays the steady
+        # state.  Must be a positive finite number.
+        poll_raw = os.getenv("SCHEDULED_APPROVAL_POLL_SECONDS", "0.25")
+        self.scheduled_poll_seconds: float = float(poll_raw)
+        if (
+            not math.isfinite(self.scheduled_poll_seconds)
+            or self.scheduled_poll_seconds <= 0
+        ):
+            raise ValueError(
+                "SCHEDULED_APPROVAL_POLL_SECONDS must be a finite, positive "
+                f"number, got {poll_raw}"
+            )
+
 
 settings = Settings()
