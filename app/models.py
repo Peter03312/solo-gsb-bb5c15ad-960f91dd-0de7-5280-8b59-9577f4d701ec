@@ -47,6 +47,17 @@ History is event-sourced:
                            release revocation are ordinary approval /
                            revocation events flagged ``emergency`` /
                            ``emergency_release``;
+* ``scheduled_approvals`` - one row per operator-booked UTC auto-approval
+                           appointment for a pending application.  Exactly one
+                           ``scheduled`` row may exist per application; it is
+                           either cancelled/rescheduled before firing,
+                           invalidated when the application is decided by
+                           another path, or processed exactly once at its due
+                           time (re-adjudicated then: approved on one new
+                           revision, or recorded blocked while the
+                           application stays pending and no revision is used).
+                           The approval itself is an ordinary
+                           ``approval_events`` row flagged ``scheduled``;
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -71,8 +82,10 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import JSON
 
 
 class Base(DeclarativeBase):
@@ -157,6 +170,14 @@ class ApprovalEvent(Base):
     # (EmergencyOccupation) links this revision; the approval event itself is
     # otherwise an ordinary, immutable approval record.
     emergency: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    # True when this approval was granted by a due scheduled (booked)
+    # auto-approval appointment.  The ScheduledApproval audit row links this
+    # revision; the approval event keeps the ordinary approval semantics and
+    # is never rewritten (its ``auto_approved`` flag stays false: a scheduled
+    # approval is not a waitlist drain decision).
+    scheduled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -531,4 +552,101 @@ class EmergencyOccupation(Base):
     )
     released_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+
+class ScheduledApproval(Base):
+    """An operator-booked UTC auto-approval appointment for one application.
+
+    Operators book an appointment for a ``pending`` application at a UTC
+    instant strictly after the booking time and strictly before the
+    application's own time window ends.  Booking consumes no revision; at most
+    one ``scheduled`` row exists per application (partial unique index), and
+    it may be cancelled or rescheduled before it fires.
+
+    A background sweeper (and a startup catch-up pass) processes due rows
+    inside the shared singleton revision arbitration.  At the actual
+    processing instant the application is re-adjudicated against the live
+    guard band, the current effective set and every active restriction
+    window:
+
+    * it passes  -> one ordinary ``ApprovalEvent`` flagged ``scheduled``
+      consumes exactly one new revision, a queued application leaves the
+      waitlist first, and the appointment becomes ``approved``;
+    * it clashes or hits a window -> the blockers are recorded on this row,
+      the appointment becomes ``blocked``, the application stays ``pending``
+      and no revision is consumed; nothing is retried automatically.
+
+    An application decided first by another path -- a manual single/batch
+    approval, a license-handover successor approval, an emergency occupation
+    or a waitlist auto-approval during a suspend/revoke/emergency-release
+    drain -- leaves its appointment ``invalidated`` inside the same
+    transaction, so it can never fire afterwards.  Cancellation,
+    rescheduling, due processing and the other decisions therefore compete
+    under one arbitration and exactly one outcome wins; a restart never
+    approves the same appointment twice (only ``scheduled`` rows fire).
+    """
+
+    __tablename__ = "scheduled_approvals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # The booked UTC auto-approval instant; rescheduling overwrites it and
+    # bumps ``updated_at`` (the original booking time is kept for audit).
+    scheduled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # "scheduled"  - waiting for ``scheduled_at`` (the only actionable state);
+    # "approved"   - processed: an ordinary scheduled approval was granted;
+    # "blocked"    - processed: interference/window hit, still pending, no
+    #                automatic retry (blockers in ``blocked_details``);
+    # "cancelled"  - withdrawn by an operator before it fired;
+    # "invalidated"- the application was decided by another path first.
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="scheduled", server_default="scheduled"
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Processing outcome fields (NULL while the appointment is still
+    # scheduled/cancelled-before-processing).
+    # The UTC instant the sweeper actually re-adjudicated the appointment.
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Revision consumed by the scheduled approval (NULL when blocked).
+    approval_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Guard band snapshot used by the processing-time re-adjudication.
+    processed_guard_band: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Blocking detail captured when processing found interference/window hits:
+    # {"conflicts": [...], "restriction_window_conflicts": [...]} in the same
+    # shape as a pending preview.
+    blocked_details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Why a terminal non-approval state was reached (operator reason on
+    # cancel; short machine reason on invalidation, e.g.
+    # "manual_approval" / "waitlist_auto_approval" / "license_transfer" /
+    # "emergency_occupation").
+    outcome_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        Index(
+            "uq_scheduled_approvals_active_application",
+            "application_id",
+            unique=True,
+            sqlite_where=text("status = 'scheduled'"),
+            postgresql_where=text("status = 'scheduled'"),
+        ),
+        Index(
+            "ix_scheduled_approvals_due",
+            "status",
+            "scheduled_at",
+        ),
     )

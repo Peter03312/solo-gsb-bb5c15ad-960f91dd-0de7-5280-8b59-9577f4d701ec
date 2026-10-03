@@ -126,6 +126,8 @@ pytest -q
 | `GUARD_BAND` | `0` | **非负有限**保护带宽的**初始值**，仅在建库（或从旧版升级）时写入一次；生效值存于数据库，之后用 `POST /api/config/guard-band` 在线变更，**重启不会覆盖已生效设置**。与频率数字同单位（示例统一用 MHz，即 2.0 = 2 MHz） |
 | `APP_HOST` | `0.0.0.0` | 监听地址 |
 | `APP_PORT` | `8000` | 监听端口 |
+| `SCHEDULED_APPROVAL_POLL_SECONDS` | `0.5` | 预约自动审批后台轮询间隔（秒，最小钳制为 0.05）；到期处理、启动补处理与手动 `process-due` 共用同一仲裁逻辑 |
+| `SCHEDULED_APPROVAL_BACKGROUND` | `1` | 是否在本进程内运行到期轮询循环（`0`/`false` 关闭；关闭后仍有启动补处理与 `POST /api/scheduled-approvals/process-due` 可用） |
 
 `docker-compose.yml` 中已为容器设好上述变量；频率单位由调用方自行保持一致，
 API 不关心具体单位（坐标与半径同理，如均为米）。
@@ -518,6 +520,75 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
   幂等迁移补齐（历史事件默认按普通事件读取），既有库、已生效带宽与修订号
   不受影响，重启状态不变。
 
+### 预约自动审批（约定 UTC 时刻 → 到期在共用修订仲裁内重裁）
+
+运营人员可为**待审批（pending）**申请约定一个自动审批时刻：该 UTC 时刻必须
+**严格晚于当前时刻**且**严格早于申请自身的申请时段结束**（左闭右开，等于结束时刻
+不允许）。预约本身**不占修订号、不改变申请状态**（候补中的申请保留队位）。
+
+**预约 / 改期 / 取消**
+
+- `POST /api/applications/{id}/scheduled-approvals`，请求体
+  `{"scheduled_at": "2026-10-04T08:00:00Z", "reason": "可选"}`：
+  - 申请不存在 → 404 `not_found`；非待审 → 409 `not_pending`；时刻无时区、不晚于
+    当前或不早于申请时段结束 → 422 `scheduled_time_invalid`（`details` 用
+    `scheduled_at_not_in_future` / `scheduled_at_not_before_window_end` /
+    `naive_datetime` 逐项说明）。**任一拒绝都不留预约**。
+  - 成功返回 `id`/`scheduled_approval_id`、`status: "scheduled"`、约定时刻、
+    当前修订号（HTTP 201）。
+  - **同一申请同时只能有一个待执行预约**：对已有待执行预约的申请再次调用本接口
+    即**改期**（HTTP 200，`action: "rescheduled"`），复用同一预约 ID，不新建行。
+- `POST /api/applications/{id}/scheduled-approvals/reschedule`：到期前显式改期，
+  新时刻遵守与预约相同的合法性校验；非法时刻 → 422，**原预约保持不变**。
+  无待执行预约 → 409 `scheduled_approval_not_active`（`details.status` 给出终态）。
+- `POST /api/applications/{id}/scheduled-approvals/cancel`（请求体可省略或带
+  `reason`）：到期前取消，预约进入 `cancelled` 终态、**不占修订号**；取消后可
+  重新预约。无待执行预约 → 409 `scheduled_approval_not_active`。
+
+**到期处理（共用修订仲裁；启动补处理与后台轮询）**
+
+到期不做预判，而是在**实际处理时刻**进入与手动批准/暂停/撤销/交接/紧急占用相同的
+单例修订号锁事务，按**当时的生效保护带宽、全部有效许可与生效管制窗口**重新裁决：
+
+- **可通过** → 批准并占**一个新修订号**：写入一条普通 `approval_events` 行并标记
+  `scheduled: true`（它不是候补排空，故 `auto_approved` 仍为 `false`）；若申请
+  同时在候补，**先退出候补**；申请变为 approved，预约进入 `approved`，记录
+  `processed_at` / `approval_revision` / `processed_guard_band`。同一次扫描内
+  后处理的预约还要把刚获批的许可计入有效集合。
+- **有许可干扰或命中管制窗口** → 在预约行上**记录阻塞明细**（`blocked_details`
+  结构同待审预览：`conflicts[]` 与 `restriction_window_conflicts[]`），预约进入
+  `blocked`，**申请仍 pending、不占修订号，且不自动重试**（再次扫描不会处理它）。
+  之后可手动批准，或取消约束后**重新预约**。
+- **预约自动审批不触发候补重裁**：其他候补保持队位（与暂停/撤销释放的排空相区别）。
+
+到期处理由一个后台轮询循环驱动（间隔由 `SCHEDULED_APPROVAL_POLL_SECONDS` 控制，
+默认 0.5 秒；`SCHEDULED_APPROVAL_BACKGROUND=0` 可关闭轮询），并且**服务启动时先做
+一次补处理**：停机期间到期的预约在重启时刻按上述规则重裁。运维也可随时调用
+`POST /api/scheduled-approvals/process-due` 立即触发同一逻辑（只处理仍为
+`scheduled` 的到期行，因此重启/重复调用**绝不会重复批准**）。
+
+**其他路径先决定 → 原预约失效；竞争只有一种结果生效**
+
+申请经下列任一路径获批时，其待执行预约在**同一事务**内置为 `invalidated`
+（`outcome_reason` 标明来源），到期后不再触发：手动单笔批准（`manual_approval`）、
+整组批准（`batch_approval`）、暂停/撤销/紧急解除排空中的**候补自动批准**
+（`waitlist_auto_approval`）、换机交接的接替批准（`license_transfer`）、紧急占用
+批准（`emergency_occupation`）。取消、改期、到期处理与这些审批都在同一修订号锁上
+串行，因此**只允许一种结果生效**。
+
+**查询与历史**
+
+- `GET /api/scheduled-approvals?status=scheduled&application_id=…`：按状态/申请
+  过滤列出预约；状态取值 `scheduled`/`approved`/`blocked`/`cancelled`/`invalidated`。
+- `GET /api/scheduled-approvals/{id}`：返回预约状态、约定时刻、**实际处理时间**
+  `processed_at`、获批时的 `approval_revision`/`processed_guard_band`，或阻塞时的
+  `blocked_details`；终态另附 `outcome_reason`。
+- `GET /api/applications/{id}/scheduled-approvals`：单个申请的全部预约（含历史）。
+- `GET /api/revision/current` 追加 `scheduled_approval_ids`/`scheduled_approvals`
+  （仅待执行项）；`GET /api/revision/{n}` 的批准记录追加 `scheduled` 标志，并附
+  `scheduled_approvals[]` 预约审计行。**历史修订标明自动审批且保留原批准事件语义**：
+  预约产生的批准是普通批准事件流中一行，只是多了 `scheduled` 标记，永不追改。
+
 ### 可用调频位置查询（不改状态）
 
 `POST /api/applications/{id}/available-ranges` 为**待审批**申请寻找可用调频位置：
@@ -652,6 +723,13 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 | `POST` | `/api/emergency-occupations/{id}/release` | **解除紧急占用**（紧急申请 ID + 预期修订号；撤销紧急许可→按暂停顺序重裁恢复→FIFO 重裁候补，整笔原子） |
 | `GET` | `/api/emergency-occupations` | 列出生效紧急占用（`include_inactive`/`status` 可含已解除） |
 | `GET` | `/api/emergency-occupations/{id}` | 查询单个紧急占用（生效中或已解除） |
+| `POST` | `/api/applications/{id}/scheduled-approvals` | **预约 UTC 自动审批**（时刻须晚于当前、早于申请时段结束；不占修订号；重复调用即改期） |
+| `POST` | `/api/applications/{id}/scheduled-approvals/reschedule` | **改期**预约（到期前；新时刻同样校验） |
+| `POST` | `/api/applications/{id}/scheduled-approvals/cancel` | **取消**预约（到期前；不占修订号） |
+| `GET` | `/api/applications/{id}/scheduled-approvals` | 查询单个申请的全部预约（含历史终态） |
+| `GET` | `/api/scheduled-approvals` | 列出/过滤预约（`status`、`application_id`） |
+| `GET` | `/api/scheduled-approvals/{id}` | 查询单个预约：状态、实际处理时间、审批修订号或阻塞明细 |
+| `POST` | `/api/scheduled-approvals/process-due` | 立即处理全部到期预约（管理/运维触发；后台轮询与启动补处理走同一逻辑） |
 | `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 生效窗口 + 全部事件 |
 | `GET` | `/api/revision/compare` | 比较两个已存在修订号的带宽、许可集合、状态与按事件顺序的差异（只读） |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
@@ -691,6 +769,10 @@ UTC 左闭右开时段）加原因做**只读预演**，再携预演返回的当
 | 409 | `force_suspended` | 对**被生效紧急占用强制暂停的普通许可**执行普通暂停或普通恢复（`details.force_suspended_by` 给出紧急申请；不改状态、不占修订号；此类许可可普通撤销） |
 | 404 | `emergency_occupation_not_found` | 解除或查询一个**从未有过紧急占用**的紧急申请 ID |
 | 409 | `emergency_occupation_not_active` | **重复解除**一个已经解除的紧急占用（`details.released_revision` 给出解除修订号；不改状态、不占修订号） |
+| 422 | `scheduled_time_invalid` | 预约时刻**不是严格晚于当前 UTC 时刻**（`scheduled_at_not_in_future`）、**不早于申请时段结束**（`scheduled_at_not_before_window_end`）或为**无时区时刻**（`naive_datetime`）；整笔拒收且**不留预约** |
+| 404 | `scheduled_approval_not_found` | 查询一个从未存在的预约 ID |
+| 409 | `scheduled_approval_not_active` | 对一个**不在等待中**的预约改期/取消（已批准/已阻塞/已取消/已失效；`details.status` 给出当前状态） |
+| 404 | `not_found` | 为不存在的申请预约/改期/取消/查询自动审批（同申请类接口） |
 
 ---
 
@@ -1574,6 +1656,107 @@ curl -s "http://localhost:8000/api/revision/compare?base_revision=1&target_revis
 
 重启服务后 `current_revision`、有效集合、候补队列、保护带宽与交接历史均保持
 不变（`GUARD_BAND` 不覆盖已生效值）。
+
+### 6.20 预约自动审批：预约 → 改期/取消 → 到期重裁（通过/阻塞）→ 失效与历史
+
+约定时刻必须是 **UTC**（示例用 `date -u` 动态生成，避免示例过期）；申请自身的
+申请时段结束必须晚于约定时刻。
+
+```bash
+# 1) 提交待审申请 S（申请时段为未来 2~3 天，覆盖圆/频段自定）
+curl -s -X POST http://localhost:8000/api/applications \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"S\",\"circle\":{\"cx\":0,\"cy\":0,\"radius\":10},
+       \"frequency\":{\"low\":300,\"high\":310},
+       \"time_window\":{\"start\":\"$(date -u -d '+2 days' +%FT%TZ)\",
+                        \"end\":\"$(date -u -d '+3 days' +%FT%TZ)\"}}"
+# -> {"id": 1, "status": "pending", ...}
+
+# 2) 预约 1 小时后自动审批（必须严格晚于现在、严格早于申请时段结束）
+curl -s -X POST http://localhost:8000/api/applications/1/scheduled-approvals \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+1 hour' +%FT%TZ)\", \"reason\":\"等运营确认窗口\"}"
+# HTTP 201 ->
+# {"booked": true, "action": "booked", "id": 7, "scheduled_approval_id": 7,
+#  "application_id": 1, "scheduled_at": "2026-10-03T19:30:00Z",
+#  "status": "scheduled", "current_revision": 0, ...}
+
+# 再次调用同一接口 = 改期（同一预约 ID，HTTP 200）
+curl -s -X POST http://localhost:8000/api/applications/1/scheduled-approvals \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+2 hours' +%FT%TZ)\"}"
+# {"action": "rescheduled", "scheduled_approval_id": 7, ...}
+
+# 显式改期 / 取消（到期前；不占修订号）
+curl -s -X POST http://localhost:8000/api/applications/1/scheduled-approvals/reschedule \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+90 minutes' +%FT%TZ)\"}"
+curl -s -X POST http://localhost:8000/api/applications/1/scheduled-approvals/cancel \
+  -H 'Content-Type: application/json' -d '{"reason":"活动取消"}'
+# {"cancelled": true, "status": "cancelled", ...}
+
+# 非法时刻：不晚于当前 / 不早于申请时段结束 / 无时区 -> 422 且不留预约
+curl -s -X POST http://localhost:8000/api/applications/1/scheduled-approvals \
+  -H 'Content-Type: application/json' -d '{"scheduled_at":"2020-01-01T00:00:00Z"}'
+# HTTP 422 {"error":{"code":"scheduled_time_invalid",
+#   "details":[{"field":"scheduled_at","code":"scheduled_at_not_in_future",...}]}}
+```
+
+到期自动重裁（把预约改到 2 秒后，后台轮询默认每 0.5 秒处理；也可立即手动触发）：
+
+```bash
+# 场景 A：到期时无干扰、未命中窗口 -> 批准，占一个修订号
+curl -s -X POST http://localhost:8000/api/applications/1/scheduled-approvals \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+2 seconds' +%FT%TZ)\",\"reason\":\"\"}"
+curl -s -X POST http://localhost:8000/api/scheduled-approvals/process-due
+# {"processed_count": 1, "approved_application_ids": [1], "blocked_application_ids": [],
+#  "from_revision": 0, "final_revision": 1,
+#  "results":[{"outcome":"approved","application_id":1,"revision":1,
+#              "processed_at":"2026-10-03T...Z","guard_band":2.0}]}
+
+# 查询预约：状态 / 实际处理时间 / 审批修订号
+curl -s http://localhost:8000/api/scheduled-approvals/7
+# {"id":7,"status":"approved","scheduled_at":"...","processed_at":"...",
+#  "approval_revision":1,"processed_guard_band":2.0,...}
+
+# 历史修订标明“自动审批”，但仍是普通批准事件（scheduled=true, auto_approved=false）
+curl -s http://localhost:8000/api/revision/1
+# {"revision":1,
+#  "approvals":[{"revision":1,"application_id":1,"scheduled":true,
+#                "auto_approved":false,"release_revision":null,...}],
+#  "scheduled_approvals":[{"id":7,"status":"approved",
+#                          "approval_revision":1,...}], ...}
+```
+
+```bash
+# 场景 B：到期时有干扰（或命中管制窗口）-> 记录阻塞明细，仍 pending，不占号，不重试
+# 先让一张有效许可占住频段（申请 2：305–308 MHz，与 300–310 相交），再为其
+# 待审申请 3（305–308 MHz 会自扰的场景请改用邻近频段，例如 309–311）预约 2 秒后
+curl -s -X POST http://localhost:8000/api/applications/3/scheduled-approvals \
+  -H 'Content-Type: application/json' \
+  -d "{\"scheduled_at\":\"$(date -u -d '+2 seconds' +%FT%TZ)\"}"
+curl -s -X POST http://localhost:8000/api/scheduled-approvals/process-due
+# {"processed_count":1,"approved_application_ids":[],"blocked_application_ids":[3],
+#  "from_revision":1,"final_revision":1,
+#  "results":[{"outcome":"blocked","application_id":3,
+#    "blocked_details":{"conflicts":[{"application":{"id":2},"reason":"frequency_intersection",...}],
+#                       "restriction_window_conflicts":[]}}]}
+curl -s http://localhost:8000/api/scheduled-approvals/{预约ID}
+# -> status="blocked"，含 processed_at / processed_guard_band / blocked_details，
+#    无 approval_revision；申请 3 仍 pending，再次 process-due 处理数为 0（不自动重试）
+
+# 场景 C：申请先被手动批准（或交接/紧急/候补自动批准）-> 预约同事务失效
+curl -s -X POST http://localhost:8000/api/applications/4/approve \
+  -H 'Content-Type: application/json' -d '{"expected_revision":3}'
+curl -s http://localhost:8000/api/scheduled-approvals/{预约ID}
+# -> status="invalidated", outcome_reason="manual_approval"；到期扫描不再处理它
+```
+
+启动可用性：服务重启时先对停机期间到期的预约做一次**补处理**（逻辑与
+`process-due` 完全相同，按重启时刻的带宽/有效许可/窗口重裁），随后才开始接受
+流量；轮询间隔可用 `SCHEDULED_APPROVAL_POLL_SECONDS` 调整，
+`SCHEDULED_APPROVAL_BACKGROUND=0` 可仅保留手动/启动处理。
 
 ---
 

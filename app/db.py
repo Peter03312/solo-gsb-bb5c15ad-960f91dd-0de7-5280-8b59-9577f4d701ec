@@ -103,6 +103,15 @@ def _ensure_approval_event_waitlist_columns() -> None:
                     "ADD COLUMN emergency BOOLEAN NOT NULL DEFAULT FALSE"
                 )
             )
+        # Operator-booked scheduled auto-approvals: marks the ordinary
+        # approval event the due appointment granted.
+        if "scheduled" not in columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE approval_events "
+                    "ADD COLUMN scheduled BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
 
 
 def _ensure_emergency_columns() -> None:

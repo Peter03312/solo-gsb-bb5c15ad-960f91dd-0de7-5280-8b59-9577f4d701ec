@@ -218,3 +218,23 @@ class EmergencyOccupationReleaseRequest(BaseModel):
 
     expected_revision: int = Field(ge=0)
     reason: str = Field(default="", max_length=2000)
+
+
+class ScheduledApprovalRequest(BaseModel):
+    """Book (or reschedule) a UTC auto-approval appointment.
+
+    ``scheduled_at`` must be a timezone-aware UTC instant strictly later than
+    the booking moment and strictly earlier than the application's own time
+    window end.  Booking consumes no revision; the time-validity checks run in
+    the handler (they need the application row and the current clock) and
+    failures use the standard error envelope, leaving no appointment behind.
+    """
+
+    scheduled_at: datetime
+    reason: str = Field(default="", max_length=2000)
+
+
+class ScheduledApprovalCancelRequest(BaseModel):
+    """Withdraw a booked appointment before it fires (optional reason)."""
+
+    reason: str = Field(default="", max_length=2000)

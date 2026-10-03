@@ -32,6 +32,18 @@ POST   /api/emergency-occupations/{id}/release
                                          end an emergency (revoke/restore/drain)
 GET    /api/emergency-occupations        list active (+ released) occupations
 GET    /api/emergency-occupations/{id}    one occupation (active or released)
+POST   /api/applications/{id}/scheduled-approvals
+                                         book a UTC auto-approval appointment
+POST   /api/applications/{id}/scheduled-approvals/reschedule
+                                         move the appointment before it fires
+POST   /api/applications/{id}/scheduled-approvals/cancel
+                                         withdraw the appointment (no revision)
+GET    /api/applications/{id}/scheduled-approvals
+                                         one application's appointments
+GET    /api/scheduled-approvals          list/filter appointments
+GET    /api/scheduled-approvals/{id}      one appointment with its outcome
+POST   /api/scheduled-approvals/process-due
+                                         process every due appointment now
 GET    /api/revision/current             current revision + effective set
 GET    /api/revision/{revision}          as-of snapshot (all event types)
 GET    /api/revision/compare             compare two as-of revision snapshots
@@ -172,17 +184,42 @@ queue is re-adjudicated by the existing FIFO drain.  A stale revision or a
 repeated release changes nothing.  Snapshots and comparisons restore every
 phase revision by revision through the ordinary event replay plus the
 ``emergency_occupations`` audit rows.
+
+Scheduled auto-approvals
+------------------------
+An operator may book a UTC auto-approval appointment for a pending
+application at an instant strictly after the booking moment and strictly
+before the application's own time window ends.  Booking consumes no
+revision; an unknown/non-pending application or an invalid instant is
+rejected without leaving an appointment.  At most one waiting appointment
+exists per application and it may be cancelled or rescheduled before it
+fires.  A background sweeper (with a startup catch-up pass) processes due
+appointments inside the shared revision arbitration: at the actual
+processing instant the application is re-adjudicated against the live
+guard band, every effective license and every active restriction window.
+A pass approves it on one new revision as an ordinary ``ApprovalEvent``
+flagged ``scheduled`` (a queued application leaves the waitlist first;
+the waitlist is not re-adjudicated afterwards); a clash or window hit is
+recorded as the appointment's blocking detail, the application stays
+pending, no revision is consumed and nothing is retried automatically.
+A decision through any other path -- manual single/batch approval,
+waitlist auto-approval, a handover or an emergency occupation --
+invalidates the waiting appointment in the same transaction, so due
+processing, cancellation, rescheduling and other decisions compete under
+one lock and exactly one outcome wins; a restart never double-approves.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.exc import IntegrityError
 
 from . import adjudication
@@ -201,6 +238,7 @@ from .models import (
     RestrictionWindowEvent,
     RevisionMeta,
     RevocationEvent,
+    ScheduledApproval,
     SuspensionEvent,
     WaitlistEntry,
 )
@@ -221,6 +259,8 @@ from .schemas import (
     RestrictionWindowReleaseRequest,
     RestrictionWindowRequest,
     RevocationRequest,
+    ScheduledApprovalCancelRequest,
+    ScheduledApprovalRequest,
     SuspensionRequest,
     WaitlistRegistrationRequest,
 )
@@ -272,6 +312,15 @@ E_FORCE_SUSPENDED = "force_suspended"
 # (HTTP 404) or one whose occupation has already been released (HTTP 409).
 E_EMERGENCY_NOT_FOUND = "emergency_occupation_not_found"
 E_EMERGENCY_NOT_ACTIVE = "emergency_occupation_not_active"
+# A scheduled auto-approval appointment named an application/time the rules
+# reject: unknown application (404), a non-pending application (409), an
+# instant not strictly in the future or not strictly before the application's
+# window end (422), or an appointment that does not exist / is no longer
+# waiting to fire (404/409).
+E_SCHEDULE_NOT_FOUND = "scheduled_approval_not_found"
+E_SCHEDULE_NOT_ACTIVE = "scheduled_approval_not_active"
+E_SCHEDULE_TIME_INVALID = "scheduled_time_invalid"
+E_SCHEDULE_EXISTS = "scheduled_approval_exists"
 
 
 # --------------------------------------------------------------------------- #
@@ -282,6 +331,19 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _stored_instant(value: datetime) -> datetime:
+    """Normalise an aware instant for comparisons against stored columns.
+
+    PostgreSQL keeps timezone-aware ``DateTime(timezone=True)`` values; the
+    SQLite test backend stores them as naive UTC and hands back naive
+    timestamps, so comparisons against a query bound need the same shape.
+    """
+    aware = value.astimezone(timezone.utc)
+    if engine.dialect.name == "sqlite":
+        return aware.replace(tzinfo=None)
+    return aware
 
 
 def iso(value: datetime) -> str:
@@ -840,6 +902,12 @@ def drain_waitlist(
         row.status = "approved"
         row.approval_revision = meta.revision
         session.delete(entry)
+        # A waitlist auto-approval decides the application: any booked
+        # scheduled appointment is invalidated in the same transaction so it
+        # can never fire afterwards.
+        invalidate_scheduled_approvals(
+            session, row.id, "waitlist_auto_approval"
+        )
         effective.append(candidate)
         approved.append(
             {
@@ -871,6 +939,285 @@ def _waitlist_position(session, application_id: int) -> int | None:
         if entry.application_id == application_id:
             return position
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Scheduled auto-approvals (operator-booked UTC appointment per application)
+# --------------------------------------------------------------------------- #
+# Terminal states of an appointment; only "scheduled" rows ever fire and only
+# one of them may exist per application (partial unique index).
+SCHEDULED_STATUS = "scheduled"
+SCHEDULED_APPROVED = "approved"
+SCHEDULED_BLOCKED = "blocked"
+SCHEDULED_CANCELLED = "cancelled"
+SCHEDULED_INVALIDATED = "invalidated"
+SCHEDULED_TERMINAL_STATES = (
+    SCHEDULED_APPROVED,
+    SCHEDULED_BLOCKED,
+    SCHEDULED_CANCELLED,
+    SCHEDULED_INVALIDATED,
+)
+
+
+def invalidate_scheduled_approvals(
+    session, application_id: int, reason: str
+) -> list[ScheduledApproval]:
+    """Invalidate every still-waiting appointment of a decided application.
+
+    Called inside the same transaction that decides the application through
+    another path (manual single/batch approval, waitlist auto-approval during
+    a suspend/revoke/emergency-release drain, handover successor approval or
+    an emergency occupation).  Only ``scheduled`` rows move; already terminal
+    appointments are left untouched.  Returns the rows invalidated.
+    """
+    rows = (
+        session.query(ScheduledApproval)
+        .filter(
+            ScheduledApproval.application_id == application_id,
+            ScheduledApproval.status == SCHEDULED_STATUS,
+        )
+        .all()
+    )
+    for row in rows:
+        row.status = SCHEDULED_INVALIDATED
+        row.outcome_reason = reason
+        row.updated_at = datetime.now(timezone.utc)
+    return rows
+
+
+def serialize_scheduled_approval(
+    session, booking: ScheduledApproval
+) -> dict[str, Any]:
+    """Public shape of one appointment (waiting, processed or cancelled)."""
+    app_row = session.get(Application, booking.application_id)
+    body: dict[str, Any] = {
+        "id": booking.id,
+        "application_id": booking.application_id,
+        "scheduled_at": iso(booking.scheduled_at),
+        "status": booking.status,
+        "reason": booking.reason,
+        "created_at": iso(booking.created_at),
+        "updated_at": iso(booking.updated_at),
+        "waitlist_position": _waitlist_position(
+            session, booking.application_id
+        ),
+        "application": (
+            serialize_application(app_row) if app_row is not None else None
+        ),
+    }
+    if booking.processed_at is not None:
+        # The UTC instant the appointment was actually re-adjudicated.
+        body["processed_at"] = iso(booking.processed_at)
+    if booking.processed_guard_band is not None:
+        body["processed_guard_band"] = booking.processed_guard_band
+    if booking.approval_revision is not None:
+        body["approval_revision"] = booking.approval_revision
+    if booking.blocked_details is not None:
+        body["blocked_details"] = booking.blocked_details
+    if booking.outcome_reason is not None:
+        body["outcome_reason"] = booking.outcome_reason
+    return body
+
+
+def get_active_schedule(session, application_id: int) -> ScheduledApproval | None:
+    """The application's one waiting appointment, if any."""
+    return (
+        session.query(ScheduledApproval)
+        .filter(
+            ScheduledApproval.application_id == application_id,
+            ScheduledApproval.status == SCHEDULED_STATUS,
+        )
+        .one_or_none()
+    )
+
+
+def process_due_scheduled_approvals(
+    session,
+    meta: RevisionMeta,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Re-adjudicate every due appointment inside the shared arbitration.
+
+    Runs in one transaction while holding the singleton revision lock (so it
+    cannot interleave with a manual approval, a suspend/revoke drain, a
+    cancellation or a reschedule).  Due appointments are visited strictly in
+    ``(scheduled_at, id)`` order and each is decided against the state at the
+    *actual processing instant*:
+
+    * the application is still pending, has no interference and hits no
+      window -> one ordinary ``ApprovalEvent`` flagged ``scheduled`` consumes
+      the next revision; a queued application leaves the waitlist first; the
+      appointment becomes ``approved`` and the new license joins the
+      effective set for the following appointments;
+    * it clashes with an effective license or hits a window -> the blockers
+      are recorded, the appointment becomes ``blocked``, the application stays
+      pending and **no** revision is consumed; there is no automatic retry;
+    * the application is no longer pending (a concurrent decision committed
+      earlier under the lock invalidated the appointment) -> the row is
+      skipped, it never fires.
+
+    A scheduled approval never triggers a waitlist re-adjudication: other
+    standbys keep their place.  Returns one result dict per processed
+    appointment (approved or blocked).
+    """
+    current = now if now is not None else datetime.now(timezone.utc)
+    current = current.astimezone(timezone.utc)
+
+    due = (
+        session.query(ScheduledApproval)
+        .filter(
+            ScheduledApproval.status == SCHEDULED_STATUS,
+            ScheduledApproval.scheduled_at <= _stored_instant(current),
+        )
+        .order_by(ScheduledApproval.scheduled_at, ScheduledApproval.id)
+        .all()
+    )
+    results: list[dict[str, Any]] = []
+    for booking in due:
+        # The booking may have been invalidated by an earlier decision in the
+        # same transaction (defensive: the query predates those writes).
+        if booking.status != SCHEDULED_STATUS:
+            continue
+        row = session.get(Application, booking.application_id)
+        booking.processed_at = current
+        booking.processed_guard_band = meta.guard_band
+
+        if row is None or row.status != "pending":
+            # Decided by another path first; that path invalidated the row.
+            if row is not None:
+                invalidate_scheduled_approvals(
+                    session, row.id, f"application_{row.status}"
+                )
+            continue
+
+        candidate = to_license(row)
+        effective = load_effective_licenses(session)
+        conflicts = adjudication.evaluate(
+            candidate, effective, meta.guard_band
+        )
+        window_rows = load_active_windows(session)
+        window_hits = window_hits_for(candidate, window_rows)
+
+        if conflicts or window_hits:
+            # Blocked at processing time: stay pending, consume no revision,
+            # record the blockers once and never retry automatically.
+            booking.status = SCHEDULED_BLOCKED
+            booking.blocked_details = {
+                "conflicts": [
+                    serialize_conflict(c, meta.guard_band) for c in conflicts
+                ],
+                "restriction_window_conflicts": [
+                    serialize_window_hit(h) for h in window_hits
+                ],
+            }
+            results.append(
+                {
+                    "scheduled_approval_id": booking.id,
+                    "application_id": row.id,
+                    "outcome": SCHEDULED_BLOCKED,
+                    "processed_at": iso(current),
+                    "guard_band": meta.guard_band,
+                    "blocked_details": booking.blocked_details,
+                }
+            )
+            continue
+
+        # Passes: a queued application leaves the standby queue first.
+        entry = (
+            session.query(WaitlistEntry)
+            .filter(WaitlistEntry.application_id == row.id)
+            .one_or_none()
+        )
+        was_waitlisted = entry is not None
+        if entry is not None:
+            session.delete(entry)
+
+        meta.revision += 1
+        session.add(
+            ApprovalEvent(
+                revision=meta.revision,
+                application_id=row.id,
+                guard_band=meta.guard_band,
+                auto_approved=False,
+                release_revision=None,
+                scheduled=True,
+            )
+        )
+        row.status = "approved"
+        row.approval_revision = meta.revision
+        booking.status = SCHEDULED_APPROVED
+        booking.approval_revision = meta.revision
+        results.append(
+            {
+                "scheduled_approval_id": booking.id,
+                "application_id": row.id,
+                "outcome": SCHEDULED_APPROVED,
+                "processed_at": iso(current),
+                "revision": meta.revision,
+                "guard_band": meta.guard_band,
+                "was_waitlisted": was_waitlisted,
+            }
+        )
+        # The new license participates in the adjudication of the later due
+        # appointments processed by this same sweep.
+        effective = load_effective_licenses(session)
+    return results
+
+
+def run_scheduled_approval_sweep(*, now: datetime | None = None) -> dict[str, Any]:
+    """Process every due appointment in one revision-arbitrated transaction.
+
+    Each due appointment gets its own outcome; approved ones consume one
+    revision each (a blocked appointment consumes none).  Safe to call from
+    the background loop, the startup catch-up pass or the explicit
+    administration trigger.  Returns a summary; on conflict the transaction
+    is rolled back and the next sweep retries (an unprocessed appointment is
+    still ``scheduled``, so it is never lost or double-approved).
+    """
+    processed: list[dict[str, Any]] = []
+    from_revision: int | None = None
+    final_revision: int | None = None
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                from_revision = meta.revision
+                processed = process_due_scheduled_approvals(
+                    session, meta, now=now
+                )
+                final_revision = meta.revision
+        except IntegrityError:
+            session.rollback()
+            log.warning(
+                "scheduled approval sweep lost the revision arbitration; "
+                "the next sweep retries the still-scheduled appointments"
+            )
+            return {
+                "processed_count": 0,
+                "approved_application_ids": [],
+                "blocked_application_ids": [],
+                "results": [],
+                "from_revision": None,
+                "final_revision": None,
+                "retried": True,
+            }
+    return {
+        "processed_count": len(processed),
+        "approved_application_ids": [
+            r["application_id"]
+            for r in processed
+            if r["outcome"] == SCHEDULED_APPROVED
+        ],
+        "blocked_application_ids": [
+            r["application_id"]
+            for r in processed
+            if r["outcome"] == SCHEDULED_BLOCKED
+        ],
+        "results": processed,
+        "from_revision": from_revision,
+        "final_revision": final_revision,
+    }
 
 
 def transfer_preview_body(
@@ -1100,6 +1447,11 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         .order_by(EmergencyOccupation.id)
         .all()
     )
+    scheduled_rows = (
+        session.query(ScheduledApproval)
+        .order_by(ScheduledApproval.id)
+        .all()
+    )
 
     # Replay every lifecycle event up to the target revision in revision
     # order; the last event of each application decides its as-of state.
@@ -1148,6 +1500,10 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             # An approval granting the license of an active/released
             # burst-communication emergency occupation.
             "emergency": bool(ev.emergency),
+            # An approval granted by a due operator-booked scheduled
+            # auto-approval appointment (keeps the ordinary approval event
+            # semantics; auto_approved stays false for these).
+            "scheduled": bool(ev.scheduled),
             "created_at": iso(ev.created_at),
             # Status of this grant *as of the queried revision*.
             "status_as_of": status_as_of,
@@ -1420,6 +1776,31 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         "resumptions": resumption_records,
         "revocations": revocation_records,
         "license_transfers": transfer_records,
+        # Operator-booked auto-approval appointments.  Bookings consume no
+        # revision, so the audit lists every appointment row; a scheduled
+        # *approval* itself is already one of the ordinary approval records
+        # above, flagged ``scheduled: true``.
+        "scheduled_approvals": [
+            {
+                "id": booking.id,
+                "application_id": booking.application_id,
+                "scheduled_at": iso(booking.scheduled_at),
+                "status": booking.status,
+                "reason": booking.reason,
+                "processed_at": (
+                    iso(booking.processed_at)
+                    if booking.processed_at is not None
+                    else None
+                ),
+                "approval_revision": booking.approval_revision,
+                "processed_guard_band": booking.processed_guard_band,
+                "blocked_details": booking.blocked_details,
+                "outcome_reason": booking.outcome_reason,
+                "created_at": iso(booking.created_at),
+                "updated_at": iso(booking.updated_at),
+            }
+            for booking in scheduled_rows
+        ],
     }
 
 
@@ -1749,6 +2130,59 @@ def build_revision_comparison(
 # --------------------------------------------------------------------------- #
 # Application factory / lifespan
 # --------------------------------------------------------------------------- #
+_sweep_task: asyncio.Task | None = None
+
+
+def _background_sweep_enabled() -> bool:
+    """Whether this process runs the scheduled-approval sweeper loop.
+
+    Default on; set SCHEDULED_APPROVAL_BACKGROUND=0/false to disable it (the
+    deterministic ``process-due`` endpoint still works, which is what the
+    SQLite tests rely on).
+    """
+    return os.getenv("SCHEDULED_APPROVAL_BACKGROUND", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _sweep_interval_seconds() -> float:
+    """Poll interval of the background sweeper (seconds, clamped to >= 0.05)."""
+    try:
+        return max(0.05, float(os.getenv("SCHEDULED_APPROVAL_POLL_SECONDS", "0.5")))
+    except ValueError:
+        return 0.5
+
+
+async def _scheduled_approval_sweep_loop() -> None:
+    """Poll for due appointments and process them off the event loop.
+
+    Due processing is synchronous DB work, so it runs in a worker thread; the
+    singleton revision lock serialises it against manual decisions, cancels
+    and reschedules.  A lost arbitration just leaves the appointment
+    ``scheduled`` for the next tick.
+    """
+    interval = _sweep_interval_seconds()
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            summary = await asyncio.to_thread(run_scheduled_approval_sweep)
+        except Exception:  # pragma: no cover - a sweep must never kill the app
+            log.exception("scheduled approval sweep failed")
+            continue
+        if summary.get("processed_count"):
+            log.info(
+                "scheduled approval sweep processed %d appointment(s): "
+                "approved=%s blocked=%s final_revision=%s",
+                summary["processed_count"],
+                summary["approved_application_ids"],
+                summary["blocked_application_ids"],
+                summary["final_revision"],
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     wait_for_database()
@@ -1756,6 +2190,26 @@ async def lifespan(app: FastAPI):
     with SessionLocal() as session:
         meta = session.get(RevisionMeta, 1)
         live_band = meta.guard_band if meta is not None else settings.guard_band
+    # Startup catch-up: appointments that came due while the process was down
+    # are re-adjudicated at the restart instant inside the shared
+    # arbitration, so a restart never silently skips or double-approves one.
+    try:
+        catch_up = await asyncio.to_thread(run_scheduled_approval_sweep)
+        if catch_up.get("processed_count"):
+            log.info(
+                "startup catch-up processed %d due scheduled approval(s): "
+                "approved=%s blocked=%s",
+                catch_up["processed_count"],
+                catch_up["approved_application_ids"],
+                catch_up["blocked_application_ids"],
+            )
+    except Exception:  # pragma: no cover - readiness must survive a sweep error
+        log.exception("startup scheduled approval catch-up failed")
+    global _sweep_task
+    if _background_sweep_enabled():
+        _sweep_task = asyncio.create_task(
+            _scheduled_approval_sweep_loop(), name="scheduled-approval-sweep"
+        )
     log.info(
         "startup complete; guard_band=%s (GUARD_BAND seed=%s) listening on %s:%s",
         live_band,
@@ -1764,6 +2218,8 @@ async def lifespan(app: FastAPI):
         settings.app_port,
     )
     yield
+    if _sweep_task is not None:
+        _sweep_task.cancel()
     engine.dispose()
 
 
@@ -1834,6 +2290,12 @@ def current_revision() -> dict[str, Any]:
             serialize_waitlist_entry(session, entry, position)
             for position, entry in enumerate(load_waitlist(session), start=1)
         ]
+        waiting_schedules = (
+            session.query(ScheduledApproval)
+            .filter(ScheduledApproval.status == SCHEDULED_STATUS)
+            .order_by(ScheduledApproval.scheduled_at, ScheduledApproval.id)
+            .all()
+        )
         active_window_rows = load_active_windows(session)
         active_emergencies = load_active_emergencies(session)
     return {
@@ -1862,6 +2324,10 @@ def current_revision() -> dict[str, Any]:
         "restriction_window_events": snapshot["restriction_window_events"],
         "waitlist_application_ids": [e["application_id"] for e in waitlist_entries],
         "waitlist_entries": waitlist_entries,
+        "scheduled_approval_ids": [b.id for b in waiting_schedules],
+        "scheduled_approvals": [
+            serialize_scheduled_approval(session, b) for b in waiting_schedules
+        ],
         "approvals": snapshot["approvals"],
         "suspensions": snapshot["suspensions"],
         "resumptions": snapshot["resumptions"],
@@ -2262,6 +2728,10 @@ def approve_application(
                 )
                 if entry is not None:
                     session.delete(entry)
+                # A manual decision supersedes any booked appointment.
+                invalidate_scheduled_approvals(
+                    session, application_id, "manual_approval"
+                )
                 session.flush()
                 response = {
                     "approved": True,
@@ -2512,6 +2982,10 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                     )
                     if entry is not None:
                         session.delete(entry)
+                    # A manual decision supersedes any booked appointment.
+                    invalidate_scheduled_approvals(
+                        session, row.id, "batch_approval"
+                    )
                     results.append(
                         {
                             "application_id": row.id,
@@ -3150,6 +3624,397 @@ def get_waitlist_entry(application_id: int) -> dict[str, Any]:
             status_code=404,
             details={"status": row.status},
         )
+
+
+# --------------------------------------------------------------------------- #
+# Scheduled auto-approvals (book / reschedule / cancel / query / sweep)
+# --------------------------------------------------------------------------- #
+def _validate_schedule_time(
+    payload: ScheduledApprovalRequest,
+    app_end_time: datetime,
+    now: datetime,
+) -> None:
+    """Reject naive / non-future / not-before-window-end booking instants.
+
+    The instant must be timezone-aware, strictly later than ``now`` and
+    strictly earlier than the application's own half-open window end.  Every
+    violation uses the standard error envelope and leaves no appointment.
+    """
+    errors: list[dict[str, Any]] = []
+    if payload.scheduled_at.tzinfo is None:
+        errors.append(
+            {
+                "field": "scheduled_at",
+                "code": "naive_datetime",
+                "message": (
+                    "scheduled_at must carry a timezone (use UTC, e.g. ...Z)"
+                ),
+            }
+        )
+    else:
+        scheduled_at = payload.scheduled_at.astimezone(timezone.utc)
+        if scheduled_at <= now:
+            errors.append(
+                {
+                    "field": "scheduled_at",
+                    "code": "scheduled_at_not_in_future",
+                    "message": (
+                        "scheduled_at must be strictly later than the current "
+                        "UTC time"
+                    ),
+                    "scheduled_at": iso(scheduled_at),
+                    "now": iso(now),
+                }
+            )
+        if scheduled_at >= _utc(app_end_time):
+            errors.append(
+                {
+                    "field": "scheduled_at",
+                    "code": "scheduled_at_not_before_window_end",
+                    "message": (
+                        "scheduled_at must be strictly earlier than the "
+                        "application time window end"
+                    ),
+                    "scheduled_at": iso(scheduled_at),
+                    "application_end_time": iso(app_end_time),
+                }
+            )
+    if errors:
+        raise APIError(
+            E_SCHEDULE_TIME_INVALID,
+            "the scheduled auto-approval time is invalid; no appointment was "
+            "booked",
+            status_code=422,
+            details=errors,
+        )
+
+
+def _book_or_reschedule_schedule(
+    application_id: int, payload: ScheduledApprovalRequest
+) -> tuple[dict[str, Any], int]:
+    """Shared create/reschedule logic; returns (body, http_status)."""
+    with SessionLocal() as session, session.begin():
+        # Serialise against due processing and every revision writer so a
+        # booking/reschedule and a firing appointment cannot interleave.
+        session.get(RevisionMeta, 1, with_for_update=True)
+
+        row = session.get(Application, application_id)
+        if row is None:
+            raise APIError(
+                E_NOT_FOUND,
+                f"application {application_id} does not exist",
+                status_code=404,
+            )
+        if row.status != "pending":
+            raise APIError(
+                E_NOT_PENDING,
+                f"application {application_id} is {row.status}; only pending "
+                "applications can have a scheduled auto-approval",
+                status_code=409,
+                details={"status": row.status},
+            )
+
+        now = datetime.now(timezone.utc)
+        _validate_schedule_time(payload, row.end_time, now)
+
+        existing = get_active_schedule(session, application_id)
+        scheduled_at = payload.scheduled_at.astimezone(timezone.utc)
+        if existing is None:
+            booking = ScheduledApproval(
+                application_id=application_id,
+                scheduled_at=scheduled_at,
+                status=SCHEDULED_STATUS,
+                reason=payload.reason,
+            )
+            session.add(booking)
+            session.flush()
+            action = "booked"
+            http_status = 201
+        else:
+            existing.scheduled_at = scheduled_at
+            existing.reason = payload.reason
+            existing.updated_at = now
+            booking = existing
+            session.flush()
+            action = "rescheduled"
+            http_status = 200
+        current = session.get(RevisionMeta, 1).revision
+        body = {
+            action: True,
+            "action": action,
+            "id": booking.id,
+            "scheduled_approval_id": booking.id,
+            "application_id": application_id,
+            "scheduled_at": iso(booking.scheduled_at),
+            "status": booking.status,
+            "reason": booking.reason,
+            "current_revision": current,
+            "application_end_time": iso(row.end_time),
+            "booked_at": iso(booking.created_at),
+            "updated_at": iso(booking.updated_at),
+        }
+        return body, http_status
+
+
+@app.post(
+    "/api/applications/{application_id}/scheduled-approvals",
+    tags=["scheduled-approvals"],
+)
+def book_scheduled_approval(
+    application_id: int, payload: ScheduledApprovalRequest
+) -> Response:
+    """Book a UTC auto-approval appointment for a pending application.
+
+    The instant must be strictly later than now and strictly earlier than the
+    application's own window end; otherwise the request is rejected and **no
+    appointment is left behind**.  Booking consumes no revision and does not
+    change the application (a queued application keeps its queue place).  One
+    application has at most one waiting appointment; calling this endpoint
+    again before it fires *reschedules* the same appointment (200, action
+    ``rescheduled``) instead of creating a second one.  Unknown application
+    -> 404; non-pending -> 409 ``not_pending``; invalid instant -> 422
+    ``scheduled_time_invalid``.
+    """
+    body, http_status = _book_or_reschedule_schedule(application_id, payload)
+    return JSONResponse(status_code=http_status, content=body)
+
+
+@app.post(
+    "/api/applications/{application_id}/scheduled-approvals/reschedule",
+    tags=["scheduled-approvals"],
+)
+def reschedule_scheduled_approval(
+    application_id: int, payload: ScheduledApprovalRequest
+) -> dict[str, Any]:
+    """Move the waiting appointment to a new UTC instant before it fires.
+
+    The new instant obeys the same validity rules as booking.  Unknown
+    application -> 404; no waiting appointment -> 409
+    ``scheduled_approval_not_active``; invalid instant -> 422
+    ``scheduled_time_invalid`` (the existing appointment is kept unchanged).
+    """
+    with SessionLocal() as session, session.begin():
+        session.get(RevisionMeta, 1, with_for_update=True)
+        row = session.get(Application, application_id)
+        if row is None:
+            raise APIError(
+                E_NOT_FOUND,
+                f"application {application_id} does not exist",
+                status_code=404,
+            )
+        existing = get_active_schedule(session, application_id)
+        if existing is None:
+            latest = (
+                session.query(ScheduledApproval)
+                .filter(ScheduledApproval.application_id == application_id)
+                .order_by(ScheduledApproval.id.desc())
+                .first()
+            )
+            raise APIError(
+                E_SCHEDULE_NOT_ACTIVE,
+                f"application {application_id} has no waiting scheduled "
+                "auto-approval; it can only be rescheduled before it fires",
+                status_code=409,
+                details=(
+                    {"status": latest.status} if latest is not None else None
+                ),
+            )
+        now = datetime.now(timezone.utc)
+        _validate_schedule_time(payload, row.end_time, now)
+        existing.scheduled_at = payload.scheduled_at.astimezone(timezone.utc)
+        existing.reason = payload.reason
+        existing.updated_at = now
+        session.flush()
+        current = session.get(RevisionMeta, 1).revision
+        return {
+            "rescheduled": True,
+            "id": existing.id,
+            "scheduled_approval_id": existing.id,
+            "application_id": application_id,
+            "scheduled_at": iso(existing.scheduled_at),
+            "status": existing.status,
+            "reason": existing.reason,
+            "current_revision": current,
+            "updated_at": iso(existing.updated_at),
+            "scheduled_approval": serialize_scheduled_approval(
+                session, existing
+            ),
+        }
+
+
+@app.post(
+    "/api/applications/{application_id}/scheduled-approvals/cancel",
+    tags=["scheduled-approvals"],
+)
+def cancel_scheduled_approval(
+    application_id: int,
+    payload: ScheduledApprovalCancelRequest | None = None,
+) -> dict[str, Any]:
+    """Withdraw the waiting appointment before it fires (no revision used).
+
+    Unknown application -> 404; no waiting appointment -> 409
+    ``scheduled_approval_not_active``.  A cancelled appointment stays in
+    history with status ``cancelled`` and a new one can be booked afterwards.
+    """
+    reason = payload.reason if payload is not None else ""
+    with SessionLocal() as session, session.begin():
+        session.get(RevisionMeta, 1, with_for_update=True)
+        row = session.get(Application, application_id)
+        if row is None:
+            raise APIError(
+                E_NOT_FOUND,
+                f"application {application_id} does not exist",
+                status_code=404,
+            )
+        existing = get_active_schedule(session, application_id)
+        if existing is None:
+            latest = (
+                session.query(ScheduledApproval)
+                .filter(ScheduledApproval.application_id == application_id)
+                .order_by(ScheduledApproval.id.desc())
+                .first()
+            )
+            raise APIError(
+                E_SCHEDULE_NOT_ACTIVE,
+                f"application {application_id} has no waiting scheduled "
+                "auto-approval to cancel",
+                status_code=409,
+                details=(
+                    {"status": latest.status} if latest is not None else None
+                ),
+            )
+        existing.status = SCHEDULED_CANCELLED
+        existing.outcome_reason = reason
+        existing.updated_at = datetime.now(timezone.utc)
+        session.flush()
+        current = session.get(RevisionMeta, 1).revision
+        return {
+            "cancelled": True,
+            "id": existing.id,
+            "scheduled_approval_id": existing.id,
+            "application_id": application_id,
+            "scheduled_at": iso(existing.scheduled_at),
+            "status": existing.status,
+            "outcome_reason": reason,
+            "current_revision": current,
+            "scheduled_approval": serialize_scheduled_approval(
+                session, existing
+            ),
+        }
+
+
+@app.get(
+    "/api/applications/{application_id}/scheduled-approvals",
+    tags=["scheduled-approvals"],
+)
+def list_application_scheduled_approvals(
+    application_id: int,
+) -> dict[str, Any]:
+    """All appointments of one application (waiting and historical)."""
+    with SessionLocal() as session:
+        row = session.get(Application, application_id)
+        if row is None:
+            raise APIError(
+                E_NOT_FOUND,
+                f"application {application_id} does not exist",
+                status_code=404,
+            )
+        bookings = (
+            session.query(ScheduledApproval)
+            .filter(ScheduledApproval.application_id == application_id)
+            .order_by(ScheduledApproval.id)
+            .all()
+        )
+        current = session.get(RevisionMeta, 1).revision
+        return {
+            "application_id": application_id,
+            "current_revision": current,
+            "count": len(bookings),
+            "scheduled_approvals": [
+                serialize_scheduled_approval(session, b) for b in bookings
+            ],
+        }
+
+
+@app.get("/api/scheduled-approvals", tags=["scheduled-approvals"])
+def list_scheduled_approvals(
+    status: str | None = None,
+    application_id: int | None = None,
+) -> dict[str, Any]:
+    """List appointments, optionally filtered by status and/or application.
+
+    ``status`` is one of ``scheduled``/``approved``/``blocked``/``cancelled``/
+    ``invalidated`` (default: every state, newest first within each
+    application history).
+    """
+    valid = {SCHEDULED_STATUS, *SCHEDULED_TERMINAL_STATES}
+    with SessionLocal() as session:
+        query = session.query(ScheduledApproval)
+        if status is not None:
+            if status not in valid:
+                raise APIError(
+                    E_VALIDATION,
+                    "status filter must be one of " + ", ".join(sorted(valid)),
+                    status_code=422,
+                )
+            query = query.filter(ScheduledApproval.status == status)
+        if application_id is not None:
+            query = query.filter(
+                ScheduledApproval.application_id == application_id
+            )
+        bookings = query.order_by(ScheduledApproval.id).all()
+        current = session.get(RevisionMeta, 1).revision
+        return {
+            "current_revision": current,
+            "count": len(bookings),
+            "scheduled_approval_ids": [b.id for b in bookings],
+            "scheduled_approvals": [
+                serialize_scheduled_approval(session, b) for b in bookings
+            ],
+        }
+
+
+@app.get(
+    "/api/scheduled-approvals/{scheduled_approval_id}",
+    tags=["scheduled-approvals"],
+)
+def get_scheduled_approval(scheduled_approval_id: int) -> dict[str, Any]:
+    """Fetch one appointment: status, actual processing time and outcome.
+
+    An approved appointment carries ``approval_revision`` and
+    ``processed_guard_band``; a blocked one carries ``blocked_details``
+    (conflicts and restriction-window hits captured at processing time).
+    """
+    with SessionLocal() as session:
+        booking = session.get(ScheduledApproval, scheduled_approval_id)
+        if booking is None:
+            raise APIError(
+                E_SCHEDULE_NOT_FOUND,
+                f"scheduled approval {scheduled_approval_id} does not exist",
+                status_code=404,
+            )
+        current = session.get(RevisionMeta, 1).revision
+        body = serialize_scheduled_approval(session, booking)
+        body["current_revision"] = current
+        return body
+
+
+@app.post(
+    "/api/scheduled-approvals/process-due",
+    tags=["scheduled-approvals"],
+)
+def process_due_scheduled_approvals_endpoint() -> dict[str, Any]:
+    """Administration/test trigger: process every due appointment now.
+
+    Does exactly what the background sweeper (and the startup catch-up pass)
+    does: lock the singleton revision row and adjudicate each due appointment
+    at the current instant.  Idempotent in the sense that only still-
+    ``scheduled`` due rows fire, so a repeated call after a restart never
+    approves the same appointment twice.  No body/expected revision is
+    required: due processing is itself a revision writer and serialises
+    against every other writer on the shared lock.
+    """
+    return run_scheduled_approval_sweep()
 
 
 # --------------------------------------------------------------------------- #
@@ -3970,6 +4835,12 @@ def confirm_license_transfer(
                 successor.status = "approved"
                 successor.approval_revision = successor_revision
 
+                # The handover decides the successor: its booked appointment
+                # (if any) is superseded in the same transaction.
+                invalidate_scheduled_approvals(
+                    session, successor.id, "license_transfer"
+                )
+
                 # The audit link between the two revisions of the handover.
                 session.add(
                     LicenseTransferEvent(
@@ -4246,6 +5117,12 @@ def confirm_emergency_occupation(
                 )
                 row.status = "approved"
                 row.approval_revision = approval_revision
+
+                # The emergency occupation decides the application: any
+                # booked appointment is superseded in the same transaction.
+                invalidate_scheduled_approvals(
+                    session, row.id, "emergency_occupation"
+                )
 
                 occupation = EmergencyOccupation(
                     emergency_application_id=row.id,

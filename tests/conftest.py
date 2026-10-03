@@ -5,6 +5,10 @@ import tempfile
 _TMP = tempfile.mkdtemp(prefix="radio-tests-")
 os.environ.setdefault("DATABASE_URL", f"sqlite:///{_TMP}/test.db")
 os.environ.setdefault("GUARD_BAND", "2.0")
+# The scheduled-approval sweeper is exercised deterministically through the
+# process-due administration endpoint; a background polling loop would race
+# the assertions.
+os.environ.setdefault("SCHEDULED_APPROVAL_BACKGROUND", "0")
 
 import pytest
 from fastapi.testclient import TestClient

@@ -405,3 +405,74 @@ post "/api/emergency-occupations/999999/release" "{\"expected_revision\":$FINAL}
 curl -s "$BASE/api/emergency-occupations?include_inactive=true" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print("occupations:", [(o["id"],o["application_id"],o["status"],o.get("released_revision")) for o in d["occupations"]])'
 
+
+# ---------------------------------------------------------------------------
+# Scheduled auto-approvals (operator-booked UTC appointment)
+# ---------------------------------------------------------------------------
+mks() { post /api/applications "{
+  \"name\":\"$1\",
+  \"circle\":{\"cx\":0,\"cy\":0,\"radius\":10},
+  \"frequency\":{\"low\":$2,\"high\":$3},
+  \"time_window\":{\"start\":\"2027-06-01T08:00:00Z\",\"end\":\"2027-06-01T12:00:00Z\"}
+}"; }
+
+echo "== 51. book a scheduled auto-approval: invalid instants are rejected with no appointment =="
+S1=$(mks "scheduled free" 900 910); S1_ID=$(echo "$S1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$S1_ID/scheduled-approvals" '{"scheduled_at":"2020-01-01T00:00:00Z"}' \
+  | python3 -c 'import json,sys; print("past instant ->", json.load(sys.stdin)["error"]["code"])'
+post "/api/applications/$S1_ID/scheduled-approvals" '{"scheduled_at":"2027-06-01T12:00:00Z"}' \
+  | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("at window end ->", e["code"], ";", [d["code"] for d in e["details"]])'
+curl -s "$BASE/api/scheduled-approvals" \
+  | python3 -c 'import json,sys; print("appointments left behind:", json.load(sys.stdin)["count"])'
+
+echo "== 52. book a valid near-future appointment; re-booking reschedules the same row =="
+DUE=$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=2)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))')
+B1=$(post "/api/applications/$S1_ID/scheduled-approvals" "{\"scheduled_at\":\"$DUE\",\"reason\":\"booked\"}")
+B1_ID=$(echo "$B1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["scheduled_approval_id"])')
+echo "    booked: $(echo "$B1" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["action"], d["status"], d["scheduled_approval_id"])')"
+DUE2=$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=3)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))')
+post "/api/applications/$S1_ID/scheduled-approvals" "{\"scheduled_at\":\"$DUE2\"}" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("re-book ->", d["action"], "same id:", d["scheduled_approval_id"]=='"$B1_ID"')'
+
+echo "== 53. trigger due processing (same path as the background poll and the startup catch-up) =="
+sleep 4
+post /api/scheduled-approvals/process-due \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print("processed:", d["processed_count"], "; approved:", d["approved_application_ids"], "; blocked:", d["blocked_application_ids"], "; final revision:", d["final_revision"])'
+curl -s "$BASE/api/scheduled-approvals/$B1_ID" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("appointment:", d["status"], "; approval_revision:", d.get("approval_revision"), "; processed_at present:", bool(d.get("processed_at")))'
+curl -s "$BASE/api/revision/current" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); ev=[a for a in d["approvals"] if a["application_id"]=='"$S1_ID"'][0]; print("approval flags -> scheduled:", ev["scheduled"], "auto_approved:", ev["auto_approved"])'
+
+echo "== 54. a clashing due appointment is blocked: stays pending, no revision, no retry =="
+S2=$(mks "incumbent" 920 930); S2_ID=$(echo "$S2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/applications/$S2_ID/approve" "{\"expected_revision\":$REV}" >/dev/null
+S3=$(mks "blocked scheduled" 925 928); S3_ID=$(echo "$S3" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+DUE3=$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S.%fZ"))')
+B3_ID=$(post "/api/applications/$S3_ID/scheduled-approvals" "{\"scheduled_at\":\"$DUE3\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["scheduled_approval_id"])')
+sleep 2
+post /api/scheduled-approvals/process-due \
+  | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print("processed:", d["processed_count"], "; approved:", d["approved_application_ids"], "; blocked:", d["blocked_application_ids"], "; final revision:", d["final_revision"])'
+curl -s "$BASE/api/scheduled-approvals/$B3_ID" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("appointment:", d["status"], "; blockers:", len(d["blocked_details"]["conflicts"]) + len(d["blocked_details"]["restriction_window_conflicts"]), "; approval_revision:", d.get("approval_revision"))'
+curl -s "$BASE/api/applications/$S3_ID" \
+  | python3 -c 'import json,sys; print("application still:", json.load(sys.stdin)["status"])'
+post /api/scheduled-approvals/process-due \
+  | python3 -c 'import json,sys; print("retry sweep processed:", json.load(sys.stdin)["processed_count"])'
+
+echo "== 55. a competing manual decision invalidates the waiting appointment; cancel after firing is refused =="
+S4=$(mks "competing scheduled" 940 950); S4_ID=$(echo "$S4" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+FAR="2027-05-31T00:00:00Z"
+B4_ID=$(post "/api/applications/$S4_ID/scheduled-approvals" "{\"scheduled_at\":\"$FAR\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["scheduled_approval_id"])')
+REV=$(curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_revision"])')
+post "/api/applications/$S4_ID/approve" "{\"expected_revision\":$REV}" >/dev/null
+curl -s "$BASE/api/scheduled-approvals/$B4_ID" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("after manual approval ->", d["status"], ";", d["outcome_reason"])'
+post "/api/applications/$S1_ID/scheduled-approvals/cancel" '{}' \
+  | python3 -c 'import json,sys; print("cancel an already approved appointment ->", json.load(sys.stdin)["error"]["code"])'
+post /api/scheduled-approvals/process-due \
+  | python3 -c 'import json,sys; print("final sweep processed:", json.load(sys.stdin)["processed_count"])'
